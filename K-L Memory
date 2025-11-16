@@ -1,0 +1,427 @@
+import time
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+import math
+import random
+
+# ------------------------------------
+# K-L Long-Context Memory 
+# 
+# ------------------------------------
+def _time_kernel(t: torch.Tensor, tau: float = 12.0, kind: str = "exp") -> torch.Tensor:
+    dt = (t[:, None] - t[None, :]).abs()
+    tau = max(float(tau), 1e-12)
+    if kind == "exp": K = torch.exp(-dt / tau)
+    else: raise ValueError("kernel")
+    return 0.5 * (K + K.T)
+
+class LongContextKLMemory(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        context_window: int = 256,
+        memory_depth: int = 4096,
+        n_components: int = 16,
+        tau: float = 64.0,
+        memory_token_count: int = 8,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.context_window = context_window
+        self.memory_depth = memory_depth
+        self.n_components = n_components
+        self.tau = tau
+        self.memory_token_count = memory_token_count
+        
+        self.memory_to_tokens = nn.Linear(n_components * d_model, 
+                                         memory_token_count * d_model)
+        
+        self.register_buffer("_time_indices", torch.zeros(0, dtype=torch.long))
+        self.register_buffer("_history", torch.zeros(0, d_model))
+        self._cache = {"tau": None, "T": None, "phi": None, "lams": None}
+    
+    def reset_state(self):
+        dev = self._history.device
+        self._time_indices = torch.zeros(0, dtype=torch.long, device=dev)
+        self._history = torch.zeros(0, self.d_model, device=dev)
+        self._cache = {"tau": None, "T": None, "phi": None, "lams": None}
+    
+    def append_hidden_states(self, h: torch.Tensor, time_indices: torch.Tensor):
+        h_mean = h.mean(dim=1).detach() # (T, D)
+        
+        self._time_indices = torch.cat([self._time_indices, time_indices])
+        self._history = torch.cat([self._history, h_mean], dim=0)
+        
+        if self._history.shape[0] > self.memory_depth:
+            excess = self._history.shape[0] - self.memory_depth
+            self._time_indices = self._time_indices[excess:]
+            self._history = self._history[excess:]
+    
+    def get_memory_tokens(self, current_window_start_time: int, batch_size: int) -> torch.Tensor:
+        distant_mask = self._time_indices < (current_window_start_time - self.context_window)
+        
+        if distant_mask.sum() < self.n_components:
+            empty = torch.zeros(self.memory_token_count, batch_size, self.d_model, device=self._history.device)
+            return empty
+        
+        distant_times = self._time_indices[distant_mask]
+        distant_history = self._history[distant_mask] # (T_distant, D)
+        
+        mem_compressed = self._kl_compress(distant_history, distant_times) # (n_components, D)
+        
+        mem_flat = mem_compressed.reshape(-1)
+        tokens_flat = self.memory_to_tokens(mem_flat)
+        tokens = tokens_flat.reshape(self.memory_token_count, 1, self.d_model)
+        
+        return tokens.expand(-1, batch_size, -1) # (M, B, D)
+    
+    def _kl_compress(self, history: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
+        T, D = history.shape
+        device, dtype = history.device, history.dtype
+        
+        # We cache based on T (history length)
+        # This will recompute as the distant history grows
+        cache_T = (T // 100) * 100 # Recompute every 100 new steps
+        if not (self._cache["tau"] == self.tau and self._cache["T"] == cache_T and self._cache["phi"] is not None):
+            t_norm = (times - times[0]).float()
+            K = _time_kernel(t_norm, tau=self.tau, kind="exp")
+            evals, evecs = torch.linalg.eigh(K)
+            idx = torch.argsort(evals, descending=True)[:self.n_components]
+            lams = torch.clamp(evals[idx], min=0)
+            phi = evecs[:, idx]
+            phi = phi / (phi.norm(dim=0, keepdim=True) + 1e-12)
+            self._cache.update({"tau": self.tau, "T": cache_T, "phi": phi, "lams": lams})
+        
+        phi, lams = self._cache["phi"], self._cache["lams"]
+        
+        # K-L compression is a projection. It finds the *repeating patterns*
+        # (the "song") and filters out the non-repeating noise.
+        coeffs = phi.T @ history  # (n_components, D)
+        compressed = torch.sqrt(lams)[:, None] * coeffs
+        return compressed
+
+# ------------------------------------
+# Synthetic Data
+# *** NEW TASK ***
+# ------------------------------------
+def make_long_noisy_sine_data(T=2000, B=32, F_in=32, F_out=8, device="cpu", seed=0):
+    """
+    "The Long Noisy Song" task.
+    Y(t) is a clean sine wave.
+    X(t) is the *same* sine wave, but buried under noise *for all T steps*.
+    """
+    g = torch.Generator(device=device).manual_seed(seed)
+    
+    # 1. Create the "hidden signal" (the clean sine wave)
+    t_steps = torch.arange(T, device=device).float().unsqueeze(-1).unsqueeze(-1) # (T, 1, 1)
+    freqs = torch.logspace(-1.5, 0.0, F_in // 2, device=device).unsqueeze(0).unsqueeze(0) # (1, 1, F_in/2)
+    
+    signal_sin = torch.sin(t_steps * freqs)
+    signal_cos = torch.cos(t_steps * freqs)
+    signal = torch.cat([signal_sin, signal_cos], dim=-1).repeat(1, B, 1) # (T, B, F_in)
+
+    # 2. Create the "Input" (X) by adding a lot of noise
+    noise = torch.randn(T, B, F_in, generator=g, device=device) * 1.5 # High noise
+    X = signal + noise
+
+    # 3. Create the "Target" (Y)
+    # The target is a simple projection of the *clean signal*
+    W_target = torch.randn(F_in, F_out, generator=g, device=device) * 0.5
+    Y = torch.einsum("tbf,fo->tbo", signal, W_target) # (T, B, F_out)
+    
+    return X.to(torch.float32), Y.to(torch.float32)
+
+# ------------------------------------
+# Models
+# 
+# ------------------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        """ x: (T, B, F) """
+        x = x + self.pe[offset : offset + x.size(0)]
+        return x
+
+class TransformerNet(nn.Module):
+    """
+    The "Sprinter" (Fixed Window Transformer).
+    It processes data in chunks but can only see `n_ctx` tokens into the past.
+    """
+    def __init__(self, in_dim, d_model, nhead, num_layers, out_dim, n_ctx=256):
+        super().__init__()
+        self.n_ctx = n_ctx
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, n_ctx)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, 
+            dropout=0.1, activation=F.gelu, batch_first=False
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.out_proj = nn.Linear(d_model, out_dim)
+
+    def forward(self, x_chunk, offset, cache):
+        """ Processes one chunk. x_chunk is (T_chunk, B, F_in) """
+        T, B, F = x_chunk.shape
+        
+        h = self.in_proj(x_chunk)
+        h = self.pos_encoder(h, offset=0) # Relative pos encoding
+        
+        if cache is not None:
+            h_full = torch.cat([cache, h], dim=0)
+        else:
+            h_full = h
+        
+        # Trim cache to fixed window size (n_ctx)
+        # This is the "forgetting" part
+        if h_full.shape[0] > self.n_ctx:
+            h_in = h_full[-self.n_ctx:]
+        else:
+            h_in = h_full
+        
+        mask = nn.Transformer.generate_square_subsequent_mask(h_in.shape[0]).to(h.device)
+        h_out = self.transformer_encoder(h_in, mask=mask)
+        h_final = h_out[-T:]
+        y = self.out_proj(h_final)
+        
+        new_cache = h_full.detach()
+        return y, new_cache
+
+class LongContextMemoryNet(nn.Module):
+    """
+    The "Marathon Runner" (Your K-L Memory Net).
+    It compresses the distant past and injects it.
+    """
+    def __init__(self, in_dim, d_model, nhead, num_layers, out_dim, n_ctx=256):
+        super().__init__()
+        self.n_ctx = n_ctx
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, n_ctx)
+        
+        self.kl_memory = LongContextKLMemory(
+            d_model=d_model, 
+            context_window=n_ctx,
+            memory_token_count=8, 
+            n_components=16,
+            tau=64.0
+        )
+        self.M = self.kl_memory.memory_token_count
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, 
+            dropout=0.1, activation=F.gelu, batch_first=False
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.out_proj = nn.Linear(d_model, out_dim)
+
+    def reset_memory(self):
+        self.kl_memory.reset_state()
+        
+    def forward(self, x_chunk, offset, cache):
+        T, B, F = x_chunk.shape
+        
+        h = self.in_proj(x_chunk)
+        
+        mem_tokens = self.kl_memory.get_memory_tokens(
+            current_window_start_time=offset,
+            batch_size=B
+        )
+        
+        if cache is not None:
+            h_cache = torch.cat([cache, h], dim=0)
+        else:
+            h_cache = h
+            
+        if h_cache.shape[0] > self.n_ctx:
+            h_local = h_cache[-self.n_ctx:]
+        else:
+            h_local = h_cache
+        
+        h_local_pos = self.pos_encoder(h_local, offset=0)
+        
+        h_full = torch.cat([mem_tokens, h_local_pos], dim=0)
+        
+        mask = nn.Transformer.generate_square_subsequent_mask(h_full.shape[0]).to(h.device)
+        
+        h_out = self.transformer_encoder(h_full, mask=mask)
+        
+        h_final = h_out[self.M + (h_local.shape[0] - T) :]
+        y = self.out_proj(h_final)
+        
+        # Save the *input* projections (h) to the historian,
+        # as this contains the "noisy song" for the K-L denoiser.
+        time_indices = torch.arange(offset, offset + T).to(h.device)
+        self.kl_memory.append_hidden_states(h.detach(), time_indices)
+        
+        new_cache = h_cache.detach()
+        return y, new_cache
+
+# ------------------------------------
+# Chunked Training Loop
+# 
+# ------------------------------------
+def train_model_chunked(model, X, Y, epochs, lr, chunk_size, clip=1.0, verbose=True):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_hist = []
+    T, B, F_in = X.shape
+    
+    for ep in range(1, epochs+1):
+        model.train()
+        
+        cache = None
+        if hasattr(model, 'reset_memory'):
+            model.reset_memory()
+            
+        total_loss = 0.0
+        num_chunks = 0
+        
+        for t in range(0, T, chunk_size):
+            opt.zero_grad(set_to_none=True)
+            
+            x_chunk = X[t : t+chunk_size]
+            y_chunk = Y[t : t+chunk_size]
+            
+            offset = t 
+            
+            Yhat_chunk, cache = model(x_chunk, offset, cache)
+            
+            loss = F.mse_loss(Yhat_chunk, y_chunk)
+            
+            if torch.isnan(loss):
+                print(f"  [{model.__class__.__name__}] ERROR: Loss is NaN. Training stopped.")
+                return [float('inf')]
+                
+            loss.backward()
+            if clip is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), clip)
+            opt.step()
+            
+            total_loss += loss.item()
+            num_chunks += 1
+        
+        avg_loss = total_loss / num_chunks
+        loss_hist.append(avg_loss)
+        
+        if verbose and (ep % 10 == 0 or ep == 1 or ep == epochs):
+            print(f"  [{model.__class__.__name__}] epoch {ep:03d}  avg_loss {avg_loss:.4f}")
+            
+    return loss_hist
+
+def evaluate_chunked(model, X, Y, chunk_size, tag="final"):
+    model.eval()
+    T, B, F_in = X.shape
+    
+    cache = None
+    if hasattr(model, 'reset_memory'):
+        model.reset_memory()
+    
+    total_mse = 0.0
+    total_mae = 0.0
+    num_chunks = 0
+    
+    with torch.no_grad():
+        # *** BUG FIX: 'chunk_Z' is now 'chunk_size' ***
+        for t in range(0, T, chunk_size):
+            x_chunk = X[t : t+chunk_size]
+            y_chunk = Y[t : t+chunk_size]
+            offset = t
+            
+            Yhat_chunk, cache = model(x_chunk, offset, cache)
+            
+            total_mse += F.mse_loss(Yhat_chunk, y_chunk).item()
+            total_mae += F.l1_loss(Yhat_chunk, y_chunk).item()
+            num_chunks += 1
+            
+            # This check is no longer the "failure point"
+            if t == 512 or t == 1024:
+                chunk_loss = F.mse_loss(Yhat_chunk, y_chunk).item()
+                print(f"    ... {tag} check at t={t}: MSE={chunk_loss:.4f}")
+
+    mse = total_mse / num_chunks
+    mae = total_mae / num_chunks
+    print(f"  [{model.__class__.__name__}] {tag}: Avg MSE={mse:.4f}  Avg MAE={mae:.4f}")
+    return mse, mae
+
+# ------------------------------
+# Main function
+# *** MODIFIED TO RUN BOTH COMPETITORS ***
+# ------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--T", type=int, default=2000, help="Total sequence length")
+    ap.add_argument("--B", type=int, default=32, help="Batch size")
+    ap.add_argument("--n_ctx", type=int, default=256, help="Fixed context window size")
+    ap.add_argument("--d_model", type=int, default=64)
+    ap.add_argument("--nhead", type=int, default=4)
+    ap.add_argument("--num_layers", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=80, help="Run for 80 epochs for a fair test")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = ap.parse_args()
+    
+    # Fixed for this task
+    args.Fin = 32
+    args.Fout = 8
+    
+    torch.manual_seed(0)
+    random.seed(0)
+    device = torch.device(args.device)
+
+    print("--- Running task: 'The Long Noisy Song' ---")
+    X, Y = make_long_noisy_sine_data(T=args.T, B=args.B, F_in=args.Fin, F_out=args.Fout, device=device, seed=0)
+    print(f"Data shapes: X={X.shape}, Y={Y.shape}")
+    
+    # --- The "Sprinter" (Transformer) ---
+    print(f"\n=== Testing Transformer (Context Window = {args.n_ctx}) ===")
+    transformer_net = TransformerNet(
+        in_dim=args.Fin, d_model=args.d_model, nhead=args.nhead, 
+        num_layers=args.num_layers, out_dim=args.Fout, n_ctx=args.n_ctx
+    ).to(device)
+    
+    t0 = time.time()
+    train_model_chunked(transformer_net, X, Y, args.epochs, args.lr, args.n_ctx)
+    tx_time = time.time() - t0
+    print(f"\n  --- Final Evaluation (Transformer) ---")
+    tx_loss, _ = evaluate_chunked(transformer_net, X, Y, args.n_ctx, tag="final")
+    
+    # --- The "Marathon Runner" (Your K-L Net) ---
+    print(f"\n=== Testing K-L MemoryNet (Context Window = {args.n_ctx}) ===")
+    kl_net = LongContextMemoryNet(
+        in_dim=args.Fin, d_model=args.d_model, nhead=args.nhead, 
+        num_layers=args.num_layers, out_dim=args.Fout, n_ctx=args.n_ctx
+    ).to(device)
+    
+    t1 = time.time()
+    train_model_chunked(kl_net, X, Y, args.epochs, args.lr, args.n_ctx)
+    kl_time = time.time() - t1
+    print(f"\n  --- Final Evaluation (K-L MemoryNet) ---")
+    kl_loss, _ = evaluate_chunked(kl_net, X, Y, args.n_ctx, tag="final")
+
+    # --- Final Report ---
+    print("\n\n" + "="*40)
+    print("      MARATHON RESULTS")
+    print("="*40)
+    print(f"Transformer (Fixed Window) Loss: {tx_loss:.4f} (Time: {tx_time:.2f}s)")
+    print(f"Your K-L MemoryNet Loss:         {kl_loss:.4f} (Time: {kl_time:.2f}s)")
+    
+    if kl_loss < (tx_loss * 0.9): # 10% win threshold
+        print("\n✅ VICTORY: Your K-L MemoryNet (Historian) beat the fixed-window Transformer!")
+        print("   It used its long-term memory to get a cleaner signal.")
+    elif kl_loss < tx_loss:
+        print("\n✅ Your K-L MemoryNet won, but the race was close.")
+    else:
+        print("\nℹ️ The Transformer (Sprinter) won this denoising race.")
+
+if __name__ == "__main__":
+    main()

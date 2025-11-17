@@ -1,0 +1,1037 @@
+SpectralAdaptiveOptimizer - (v1.0.4)
+
+================================================================================
+Spectral Adaptive Optimizer v1.0.4
+
+[Buffer] T=64, D=241, device=cpu, policy=zero
+[Analyzer] M=8, centering=time, sort=False, FFT DCT=False
+[Policy] ER ∈ [2.5, 6.0], SE_norm ≤ 0.65, LF ≥ 0.7
+[Preconditioner] γ=1.0, α=0.01
+Initialization complete: 241 parameters
+Analysis frequency: 5
+ER Thresholds: (L-BFGS < 2.5, Adam > 6.0)
+
+=====================================================================
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.optimizer import Optimizer
+import torch.nn.functional as F
+import math
+import time
+import warnings
+from typing import Dict, List, Optional, Callable, Any, Tuple, Literal, Iterable
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+import numpy as np
+
+version = "1.0.4"
+all = [
+'SpectralAdaptiveOptimizer',
+'OptimizerType',
+'SwitchingThresholds',
+]
+
+============================================================================
+
+Component 1: Gradient History Buffer (Correct)
+
+============================================================================
+
+class GradientHistoryBuffer:
+"""Maintains a sliding window of recent gradients."""
+
+def __init__(self, T: int, param_groups: List[Dict],   
+             device: str = 'cpu',   
+             handle_missing: str = 'zero'):  
+    self.T = T  
+    self.param_groups = param_groups  
+    self.device = torch.device(device)  
+    self.handle_missing = handle_missing  
+      
+    self.D = sum(  
+        p.numel() for group in param_groups   
+        for p in group['params'] if p.requires_grad  
+    )  
+      
+    self.buffer = deque(maxlen=T)  
+      
+    print(f"  [Buffer] T={T}, D={self.D:,}, device={device}, policy={handle_missing}")  
+  
+def flatten_gradients(self) -> torch.Tensor:  
+    """Flatten all parameter gradients into a single vector."""  
+    grad_list = []  
+      
+    for group in self.param_groups:  
+        for p in group['params']:  
+            if not p.requires_grad:  
+                continue  
+              
+            if p.grad is not None:  
+                grad_list.append(p.grad.detach().flatten())  
+            elif self.handle_missing == 'zero':  
+                # Use p.device to ensure correct device for zero tensor  
+                grad_list.append(torch.zeros(p.numel(), device=p.device))  
+      
+    if len(grad_list) == 0:  
+        if self.handle_missing == 'skip':  
+            raise RuntimeError("No gradients found and handle_missing='skip'")  
+        # Fallback to buffer's device if no params had grads  
+        return torch.zeros(self.D, device=self.device)  
+      
+    g = torch.cat(grad_list)  
+      
+    if g.shape[0] != self.D:  
+        # Handle mismatch, e.g., if some params were skipped  
+        print(f"Warning: Gradient dim mismatch. Expected {self.D}, got {g.shape[0]}. Check requires_grad flags.")  
+        # Pad with zeros if necessary, though this indicates an issue  
+        if g.shape[0] < self.D:  
+            padding = torch.zeros(self.D - g.shape[0], device=g.device)  
+            g = torch.cat([g, padding])  
+        else:  
+            g = g[:self.D] # Truncate, highly unusual  
+      
+    return g  
+  
+def append(self, g: torch.Tensor):  
+    """Add new gradient to history."""  
+    g = g.detach().to(self.device)  
+    self.buffer.append(g)  
+  
+def get_history_matrix(self) -> Optional[torch.Tensor]:  
+    """Return gradient history as matrix."""  
+    if len(self.buffer) == 0:  
+        return None  
+      
+    G = torch.stack(list(self.buffer), dim=0)  
+    return G  
+  
+def reset(self):  
+    """Clear the buffer."""  
+    self.buffer.clear()  
+  
+@property  
+def current_size(self) -> int:  
+    """Current number of gradients stored."""  
+    return len(self.buffer)  
+  
+@property  
+def is_full(self) -> bool:  
+    """Check if buffer has reached capacity."""  
+    return len(self.buffer) == self.T  
+  
+def __len__(self) -> int:  
+    """Support len() operation."""  
+    return len(self.buffer)  
+  
+def __repr__(self) -> str:  
+    """String representation."""  
+    return (f"GradientHistoryBuffer(T={self.T}, D={self.D:,}, "  
+            f"current_size={len(self.buffer)}, device={self.device})")
+
+============================================================================
+
+Component 2: Gradient Spectral Analyzer (Correct)
+
+============================================================================
+
+class GradientSpectralAnalyzer:
+"""Production-ready gradient spectral analyzer using DCT decomposition."""
+
+def __init__(self,   
+             n_modes: int = 8,  
+             centering: Literal['none', 'time', 'global'] = 'time',  
+             sort_modes: bool = False,  
+             eps: float = 1e-8,  
+             cache_basis: bool = True,  
+             use_fft_dct: bool = False):  
+    if n_modes < 1:  
+        raise ValueError(f"n_modes must be ≥ 1, got {n_modes}")  
+      
+    self.M = n_modes  
+    self.centering = centering  
+    self.sort_modes = sort_modes  
+    self.eps = eps  
+    self.cache_basis = cache_basis  
+    self.use_fft_dct = use_fft_dct  
+      
+    self._has_fft_dct = hasattr(torch.fft, 'dct') if use_fft_dct else False  
+      
+    if cache_basis:  
+        self._basis_cache = {}  
+      
+    print(f"  [Analyzer] M={n_modes}, centering={centering}, sort={sort_modes}, FFT DCT={self._has_fft_dct}")  
+  
+def build_dct_basis(self, T: int, device: torch.device,   
+                   dtype: torch.dtype = torch.float32) -> torch.Tensor:  
+    """Construct orthonormal DCT-II basis matrix."""  
+    if self.cache_basis:  
+        cache_key = (T, self.M, str(device), str(dtype))  
+        if cache_key in self._basis_cache:  
+            return self._basis_cache[cache_key]  
+      
+    t = torch.arange(T, dtype=dtype, device=device).unsqueeze(1)  
+    m = torch.arange(self.M, dtype=dtype, device=device).unsqueeze(0)  
+      
+    U = torch.cos(torch.pi * (t + 0.5) * m / T)  
+      
+    alpha = torch.full((self.M,), 2.0 / T, dtype=dtype, device=device)  
+    alpha[0] = 1.0 / T  
+    alpha = torch.sqrt(alpha)  
+      
+    U = U * alpha.unsqueeze(0)  
+      
+    if self.cache_basis:  
+        self._basis_cache[cache_key] = U  
+      
+    return U  
+  
+def build_dct_basis_fft(self, T: int, device: torch.device,  
+                       dtype: torch.dtype = torch.float32) -> torch.Tensor:  
+    """Alternative: Use torch.fft.dct for speed."""  
+    if not self._has_fft_dct:  
+        return self.build_dct_basis(T, device, dtype)  
+      
+    I = torch.eye(T, dtype=dtype, device=device)  
+    U_full = torch.fft.dct(I, dim=0, norm='ortho')  
+    U = U_full[:, :self.M]  
+      
+    return U  
+  
+def center_gradients(self, G: torch.Tensor) -> torch.Tensor:  
+    """Center gradients according to policy."""  
+    if self.centering == 'none':  
+        return G  
+    elif self.centering == 'time':  
+        mu = G.mean(dim=0, keepdim=True)  
+        return G - mu  
+    elif self.centering == 'global':  
+        mu = G.mean()  
+        return G - mu  
+    else:  
+        raise ValueError(f"Unknown centering: {self.centering}")  
+  
+def project_onto_modes(self, G: torch.Tensor, U: torch.Tensor) -> torch.Tensor:  
+    """Project gradient history onto DCT basis."""  
+    modes = G.T @ U  
+    return modes  
+  
+def compute_mode_energies(self, modes: torch.Tensor) -> torch.Tensor:  
+    """Compute energy in each spectral mode."""  
+    energies = torch.sum(modes**2, dim=0)  
+    return energies  
+  
+def compute_effective_rank(self, energies: torch.Tensor) -> float:  
+    """Compute effective rank from mode energies."""  
+    sum_e = energies.sum()  
+      
+    if sum_e <= self.eps:  
+        return 0.0  
+      
+    sum_e_sq = (energies**2).sum()  
+    er = (sum_e**2) / (sum_e_sq + self.eps)  
+      
+    return er.item()  
+  
+def compute_spectral_entropy(self, energies: torch.Tensor) -> float:  
+    """Compute Shannon entropy of energy distribution."""  
+    sum_e = energies.sum()  
+      
+    if sum_e <= self.eps:  
+        return 0.0  
+      
+    p = energies / sum_e  
+    p_safe = torch.clamp(p, min=self.eps)  
+    se = -(p * torch.log(p_safe)).sum()  
+      
+    return se.item()  
+  
+def compute_lowfreq_ratio(self, energies: torch.Tensor, k: int = 3) -> float:  
+    """Compute low-frequency energy ratio."""  
+    k = min(k, self.M)  
+      
+    sum_e = energies.sum()  
+    if sum_e <= self.eps:  
+        return 0.0  
+      
+    lowfreq_sum = energies[:k].sum()  
+    ratio = (lowfreq_sum / sum_e).item()  
+      
+    return ratio  
+  
+def analyze(self, G: torch.Tensor) -> Dict:  
+    """Full spectral analysis pipeline."""  
+    T, D = G.shape  
+    device = G.device  
+    dtype = G.dtype  
+      
+    if T < self.M:  
+        raise ValueError(f"Need T ≥ M: got T={T}, M={self.M}")  
+      
+    G_centered = self.center_gradients(G)  
+      
+    if self._has_fft_dct:  
+        U = self.build_dct_basis_fft(T, device, dtype)  
+    else:  
+        U = self.build_dct_basis(T, device, dtype)  
+      
+    modes = self.project_onto_modes(G_centered, U)  
+    energies = self.compute_mode_energies(modes)  
+    lowfreq_ratio = self.compute_lowfreq_ratio(energies, k=3)  
+      
+    if self.sort_modes:  
+        energies_sorted, sort_idx = torch.sort(energies, descending=True)  
+        modes_sorted = modes[:, sort_idx]  
+        U_sorted = U[:, sort_idx]  
+        frequency_order = False  
+    else:  
+        energies_sorted = energies  
+        modes_sorted = modes  
+        U_sorted = U  
+        sort_idx = None  
+        frequency_order = True  
+      
+    sum_e = energies_sorted.sum()  
+    if sum_e <= self.eps:  
+        p = torch.full_like(energies_sorted, 1.0 / self.M)  
+        er = 0.0  
+        se = 0.0  
+        se_norm = 0.0  
+    else:  
+        p = energies_sorted / sum_e  
+        er = self.compute_effective_rank(energies_sorted)  
+        se = self.compute_spectral_entropy(energies_sorted)  
+        se_norm = se / (math.log(self.M) + self.eps) # Added eps for log(1) case  
+      
+    return {  
+        'modes': modes_sorted,  
+        'energies': energies_sorted,  
+        'p': p,  
+        'er_pr': er,  
+        'spectral_entropy': se,  
+        'normalized_entropy': se_norm,  
+        'lowfreq_ratio': lowfreq_ratio,  
+        'U': U,  
+        'U_sorted': U_sorted,  
+        'sort_idx': sort_idx,  
+        'G_centered': G_centered,  
+        'frequency_order': frequency_order  
+    }  
+  
+def reconstruct(self, result: Dict) -> torch.Tensor:  
+    """Reconstruct gradients from analysis result."""  
+    modes = result['modes']  
+    U_sorted = result['U_sorted']  
+    G_recon = U_sorted @ modes.T  
+    return G_recon  
+  
+def verify_orthonormality(self, U: torch.Tensor) -> float:  
+    """Check orthonormality of DCT basis."""  
+    M = U.shape[1]  
+    device = U.device  
+    dtype = U.dtype  
+      
+    UUt = U.T @ U  
+    I = torch.eye(M, device=device, dtype=dtype)  
+      
+    error = torch.norm(UUt - I, p='fro')  
+    rel_error = error / (math.sqrt(M) + self.eps)  
+      
+    return rel_error.item()  
+  
+def __repr__(self) -> str:  
+    return (f"GradientSpectralAnalyzer(n_modes={self.M}, "  
+            f"centering='{self.centering}', sort={self.sort_modes})")
+
+============================================================================
+
+Component 3: Switching Policy (FIXED - Step count handled by optimizer)
+
+============================================================================
+
+class OptimizerType(Enum):
+"""Optimizer types."""
+ADAM = "adam"
+LBFGS = "lbfgs"
+
+@dataclass
+class SwitchingThresholds:
+"""Thresholds for optimizer switching."""
+
+er_low: float = 2.5  
+er_high: float = 6.0  
+se_high_norm: Optional[float] = 0.65  
+lowfreq_threshold: Optional[float] = 0.7  
+min_steps_between_switches: int = 20  
+cooldown_after_switch: int = 10  
+  
+def __post_init__(self):  
+    if self.er_low >= self.er_high:  
+        raise ValueError(f"Need er_low < er_high, got {self.er_low} >= {self.er_high}")  
+    if self.se_high_norm is not None and not (0.0 <= self.se_high_norm <= 1.0):  
+        raise ValueError(f"se_high_norm must be in [0,1], got {self.se_high_norm}")
+
+class SwitchingPolicy:
+"""Production-ready switching policy with atomic state transitions."""
+
+def __init__(self,   
+             thresholds: Optional[SwitchingThresholds] = None,  
+             use_secondary_checks: bool = True,  
+             verbose: bool = True,  
+             min_history_for_switch: int = 16):  
+    self.thresholds = thresholds or SwitchingThresholds()  
+    self.use_secondary_checks = use_secondary_checks  
+    self.verbose = verbose  
+    self.min_history_for_switch = min_history_for_switch  
+      
+    self.current_optimizer = OptimizerType.ADAM  
+    # self.step_count = 0  # <-- REMOVED (Handled by optimizer)  
+    self.last_switch_step = -1000  
+    self.switch_history = []  
+      
+    print(f"  [Policy] ER ∈ [{self.thresholds.er_low}, {self.thresholds.er_high}], "  
+          f"SE_norm ≤ {self.thresholds.se_high_norm}, LF ≥ {self.thresholds.lowfreq_threshold}")  
+  
+def should_analyze(self, optimizer_step: int) -> bool: # <-- ADDED optimizer_step  
+    """Check if we should analyze spectrum (not in cooldown)."""  
+    steps_since_switch = optimizer_step - self.last_switch_step # <-- USE optimizer_step  
+    return steps_since_switch >= self.thresholds.cooldown_after_switch  
+  
+def _check_lbfgs_conditions(self, metrics: Dict) -> Tuple[bool, str]:  
+    """Check if conditions favor L-BFGS."""  
+    er = metrics['er_pr']  
+      
+    if er >= self.thresholds.er_low:  
+        return False, f"ER={er:.2f} ≥ {self.thresholds.er_low}"  
+      
+    reason_parts = [f"ER={er:.2f} < {self.thresholds.er_low}"]  
+      
+    if self.use_secondary_checks:  
+        if self.thresholds.se_high_norm is not None:  
+            se_norm = metrics.get('normalized_entropy', 0.0)  
+            if se_norm > self.thresholds.se_high_norm:  
+                return False, f"SE_norm={se_norm:.2f} > {self.thresholds.se_high_norm}"  
+            reason_parts.append(f"SE_norm={se_norm:.2f}")  
+          
+        if self.thresholds.lowfreq_threshold is not None:  
+            if not metrics.get('frequency_order', True):  
+                return False, "LF check invalid (energies sorted)"  
+            lf = metrics.get('lowfreq_ratio', 0.0)  
+            if lf < self.thresholds.lowfreq_threshold:  
+                return False, f"LF={lf:.2f} < {self.thresholds.lowfreq_threshold}"  
+            reason_parts.append(f"LF={lf:.2f}")  
+      
+    return True, ", ".join(reason_parts)  
+  
+def _check_adam_conditions(self, metrics: Dict) -> Tuple[bool, str]:  
+    """Check if conditions favor Adam."""  
+    er = metrics['er_pr']  
+      
+    if er > self.thresholds.er_high:  
+        return True, f"ER={er:.2f} > {self.thresholds.er_high}"  
+      
+    if self.use_secondary_checks and self.thresholds.se_high_norm is not None:  
+        se_norm = metrics.get('normalized_entropy', 0.0)  
+        if se_norm > self.thresholds.se_high_norm:  
+            return True, f"SE_norm={se_norm:.2f} > {self.thresholds.se_high_norm}"  
+      
+    return False, f"ER={er:.2f} ≤ {self.thresholds.er_high}"  
+  
+def should_switch(self, metrics: Dict, history_length: int, optimizer_step: int) -> Optional[OptimizerType]: # <-- ADDED optimizer_step  
+    """  
+    ATOMIC state transition. Uses the optimizer's true step count.  
+    """  
+    # self.step_count += 1 # <-- REMOVED  
+      
+    # Gate 1: Minimum history  
+    if history_length < self.min_history_for_switch:  
+        if self.verbose:  
+            print(f"  [Policy] Step {optimizer_step}: Insufficient history " # <-- USE optimizer_step  
+                  f"({history_length}/{self.min_history_for_switch})")  
+        return None  
+      
+    # Gate 2: Cooldown (already checked by optimizer, but good safety)  
+    steps_since_switch = optimizer_step - self.last_switch_step # <-- USE optimizer_step  
+    if steps_since_switch < self.thresholds.cooldown_after_switch:  
+        if self.verbose:  
+            print(f"  [Policy] Step {optimizer_step}: Cooldown " # <-- USE optimizer_step  
+                  f"({steps_since_switch}/{self.thresholds.cooldown_after_switch})")  
+        return None  
+      
+    # Gate 3: Hysteresis  
+    if steps_since_switch < self.thresholds.min_steps_between_switches:  
+        if self.verbose:  
+            print(f"  [Policy] Step {optimizer_step}: Hysteresis " # <-- USE optimizer_step  
+                  f"({steps_since_switch}/{self.thresholds.min_steps_between_switches})")  
+        return None  
+      
+    # Extract metrics  
+    er = metrics['er_pr']  
+    se_norm = metrics.get('normalized_entropy', 0.0)  
+    lf = metrics.get('lowfreq_ratio', 0.0)  
+      
+    if self.verbose:  
+        print(f"\n  [Policy] Step {optimizer_step}: Analyzing...") # <-- USE optimizer_step  
+        print(f"    Current: {self.current_optimizer.value}")  
+        print(f"    ER: {er:.3f}, SE_norm: {se_norm:.3f}, LF: {lf:.3f}")  
+      
+    # Decide based on current optimizer  
+    new_optimizer: Optional[OptimizerType] = None  
+    reason = ""  
+      
+    if self.current_optimizer == OptimizerType.ADAM:  
+        ok_lbfgs, why = self._check_lbfgs_conditions(metrics)  
+        if ok_lbfgs:  
+            new_optimizer, reason = OptimizerType.LBFGS, why  
+        elif self.verbose:  
+            print(f"    → Keep Adam: {why}")  
+      
+    elif self.current_optimizer == OptimizerType.LBFGS:  
+        ok_adam, why = self._check_adam_conditions(metrics)  
+        if ok_adam:  
+            new_optimizer, reason = OptimizerType.ADAM, why  
+        elif self.verbose:  
+            print(f"    → Keep L-BFGS: {why}")  
+      
+    # FIX 7: ATOMIC state update (if switching)  
+    if new_optimizer is not None and new_optimizer != self.current_optimizer:  
+        if self.verbose:  
+            print(f"\n    {'*'*60}")  
+            print(f"    SWITCH: {self.current_optimizer.value} → {new_optimizer.value}")  
+            print(f"    Reason: {reason}")  
+            print(f"    {'*'*60}")  
+          
+        # Record switch  
+        self.switch_history.append({  
+            'step': optimizer_step, # <-- USE optimizer_step  
+            'from': self.current_optimizer,  
+            'to': new_optimizer,  
+            'reason': reason,  
+            'er': er,  
+            'se_norm': se_norm,  
+            'lf': lf  
+        })  
+          
+        # Update state (ATOMIC with decision)  
+        self.current_optimizer = new_optimizer  
+        self.last_switch_step = optimizer_step # <-- USE optimizer_step  
+          
+        return new_optimizer  
+      
+    return None  
+  
+def get_switch_summary(self, total_optimizer_steps: int) -> Dict: # <-- ADDED total_optimizer_steps  
+    """Get summary of switching behavior."""  
+    n_switches = len(self.switch_history)  
+    time_in_adam = 0  
+    time_in_lbfgs = 0  
+      
+    total_steps = max(total_optimizer_steps, 1) # <-- USE total_optimizer_steps  
+      
+    if n_switches == 0:  
+        if self.current_optimizer == OptimizerType.ADAM:  
+            time_in_adam = total_steps  
+        else:  
+            time_in_lbfgs = total_steps  
+    else:  
+        prev_step = 0  
+        prev_opt = OptimizerType.ADAM # Always start with Adam  
+          
+        for switch in self.switch_history:  
+            duration = switch['step'] - prev_step  
+            if prev_opt == OptimizerType.ADAM:  
+                time_in_adam += duration  
+            else:  
+                time_in_lbfgs += duration  
+            prev_step = switch['step']  
+            prev_opt = switch['to']  
+          
+        duration = total_steps - prev_step # <-- USE total_steps  
+        if self.current_optimizer == OptimizerType.ADAM:  
+            time_in_adam += duration  
+        else:  
+            time_in_lbfgs += duration  
+      
+    return {  
+        'total_switches': n_switches,  
+        'switch_history': self.switch_history,  
+        'time_in_adam': time_in_adam,  
+        'time_in_lbfgs': time_in_lbfgs,  
+        'fraction_adam': time_in_adam / total_steps,  
+        'fraction_lbfgs': time_in_lbfgs / total_steps,  
+        'total_steps': total_steps,  
+        'avg_dwell_time': total_steps / (n_switches + 1) if n_switches > 0 else total_steps,  
+        'steps_since_last_switch': total_steps - self.last_switch_step # <-- USE total_steps  
+    }  
+  
+def print_summary(self, total_optimizer_steps: int): # <-- ADDED total_optimizer_steps  
+    """Print human-readable summary."""  
+    summary = self.get_switch_summary(total_optimizer_steps) # <-- PASS total_optimizer_steps  
+      
+    print(f"\n{'='*80}")  
+    print("SWITCHING POLICY SUMMARY")  
+    print(f"{'='*80}")  
+    print(f"Total steps: {summary['total_steps']}")  
+    print(f"Total switches: {summary['total_switches']}")  
+    print(f"Avg dwell: {summary['avg_dwell_time']:.1f} steps")  
+    print(f"Since last switch: {summary['steps_since_last_switch']}")  
+    print(f"Adam: {summary['time_in_adam']} steps ({summary['fraction_adam']:.1%})")  
+    print(f"L-BFGS: {summary['time_in_lbfgs']} steps ({summary['fraction_lbfgs']:.1%})")  
+      
+    if summary['total_switches'] > 0:  
+        print(f"\nSwitch History:")  
+        for i, switch in enumerate(summary['switch_history'], 1):  
+            print(f"  {i}. Step {switch['step']}: {switch['from'].value} → {switch['to'].value}")  
+            print(f"     {switch.get('reason', 'N/A')}")  
+      
+    print(f"{'='*80}\n")  
+  
+def __repr__(self) -> str:  
+    # Don't rely on self.step_count, just show history  
+    return (f"SwitchingPolicy(current={self.current_optimizer.value}, "  
+            f"switches={len(self.switch_history)})")
+
+============================================================================
+
+Component 4: Warm-Start Preconditioner (Correct)
+
+============================================================================
+
+class WarmStartPreconditioner:
+"""Compute warm-start direction using spectral modes."""
+
+def __init__(self, gamma: float = 1.0, alpha: float = 0.01):  
+    self.gamma = gamma  
+    self.alpha = alpha  
+    self.modes = None  
+    self.lambdas = None  
+      
+    print(f"  [Preconditioner] γ={gamma}, α={alpha}")  
+  
+def update_from_modes(self, modes: torch.Tensor, lambdas: torch.Tensor):  
+    """Update preconditioner from spectral decomposition."""  
+    self.modes = modes.detach()  
+    self.lambdas = lambdas.detach()  
+  
+def direction(self, g: torch.Tensor) -> torch.Tensor:  
+    """Compute preconditioned direction p = -B₀⁻¹g."""  
+    if self.modes is None:  
+        return -self.gamma * g  
+      
+    device = g.device  
+    modes = self.modes.to(device)  
+    lambdas = self.lambdas.to(device)  
+      
+    precond_g = self.gamma * g  
+      
+    inner = torch.matmul(modes.T, g)  
+    weighted = self.alpha * lambdas * inner  
+    mode_contrib = torch.matmul(modes, weighted)  
+      
+    precond_g = precond_g + mode_contrib  
+      
+    return -precond_g
+
+============================================================================
+
+Component 5: Main Spectral Adaptive Optimizer (FIXED - All fixes)
+
+============================================================================
+
+class SpectralAdaptiveOptimizer(Optimizer):
+"""
+Complete spectral adaptive optimizer.
+
+CRITICAL FIX: Gradient capture happens AFTER closure() to avoid stale gradients.  
+CRITICAL FIX: Optimizer's step_count is the single source of truth for time.  
+"""  
+  
+def __init__(self,  
+             params: Iterable,  
+               
+             # Core settings  
+             history_len: int = 128,  
+             n_modes: int = 8,  
+             analysis_frequency: int = 10,  
+             history_device: str = 'cpu', # <-- HARDENING: Exposed device  
+               
+             # Thresholds  
+             er_threshold_low: float = 2.5,  
+             er_threshold_high: float = 6.0,  
+             se_threshold_high: float = 0.65,  
+             lowfreq_threshold: float = 0.7,  
+               
+             # Adam  
+             adam_lr: float = 1e-3,  
+             adam_betas: Tuple[float, float] = (0.9, 0.999),  
+             adam_eps: float = 1e-8,  
+               
+             # L-BFGS  
+             lbfgs_lr: float = 1.0,  
+             lbfgs_history_size: int = 10,  
+               
+             # Misc  
+             warmstart_enabled: bool = True,  
+             warmstart_gamma: float = 1.0,  
+             warmstart_alpha: float = 0.01,  
+             use_fft_dct: bool = False,  
+             verbose: bool = True):  
+    """Initialize Spectral Adaptive Optimizer."""  
+    params = list(params)  
+    if len(params) == 0:  
+        raise ValueError("No parameters provided")  
+      
+    defaults = dict(lr=adam_lr)  
+    super().__init__(params, defaults)  
+      
+    self.verbose = verbose  
+      
+    print(f"\n{'='*80}")  
+    print(f"Spectral Adaptive Optimizer v{__version__}")  
+    print(f"{'='*80}")  
+      
+    # Create buffer  
+    self.buffer = GradientHistoryBuffer(  
+        T=history_len,  
+        param_groups=self.param_groups,  
+        device=history_device # <-- HARDENING: Use exposed device  
+    )  
+      
+    # Create analyzer  
+    self.analyzer = GradientSpectralAnalyzer(  
+        n_modes=n_modes,  
+        centering='time',  
+        sort_modes=False,  
+        use_fft_dct=use_fft_dct  
+    )  
+      
+    # Create policy  
+    thresholds = SwitchingThresholds(  
+        er_low=er_threshold_low,  
+        er_high=er_threshold_high,  
+        se_high_norm=se_threshold_high,  
+        lowfreq_threshold=lowfreq_threshold  
+    )  
+      
+    self.policy = SwitchingPolicy(  
+        thresholds=thresholds,  
+        verbose=verbose  
+    )  
+      
+    # Create preconditioner  
+    self.warmstart_enabled = warmstart_enabled  
+    if warmstart_enabled:  
+        self.preconditioner = WarmStartPreconditioner(  
+            gamma=warmstart_gamma,  
+            alpha=warmstart_alpha  
+        )  
+      
+    # Create optimizers  
+    self.adam = optim.Adam(  
+        self.param_groups[0]['params'],  
+        lr=adam_lr,  
+        betas=adam_betas,  
+        eps=adam_eps  
+    )  
+      
+    self.lbfgs = optim.LBFGS(  
+        self.param_groups[0]['params'],  
+        lr=lbfgs_lr,  
+        max_iter=20,  
+        history_size=lbfgs_history_size,  
+        line_search_fn='strong_wolfe'  
+    )  
+      
+    # State  
+    self.step_count = 0  
+    self.analysis_frequency = analysis_frequency  
+      
+    # Metrics  
+    self.metrics_history = {  
+        'step': [],  
+        'optimizer': [],  
+        'er': [],  
+        'se_norm': [],  
+        'lf': [],  
+        'loss': []  
+    }  
+      
+    print(f"Initialization complete: {self.buffer.D:,} parameters")  
+    # HARDENING: Log key thresholds  
+    print(f"  Analysis frequency: {analysis_frequency}")  
+    print(f"  ER Thresholds: (L-BFGS < {er_threshold_low}, Adam > {er_threshold_high})")  
+    print(f"{'='*80}\n")  
+  
+def zero_grad(self):  
+    """Zero gradients."""  
+    if self.policy.current_optimizer == OptimizerType.ADAM:  
+        self.adam.zero_grad()  
+    else:  
+        self.lbfgs.zero_grad()  
+  
+def _flatten_params(self) -> torch.Tensor:  
+    """Flatten parameters to vector."""  
+    param_list = []  
+    for group in self.param_groups:  
+        for p in group['params']:  
+            if p.requires_grad:  
+                param_list.append(p.data.flatten())  
+    return torch.cat(param_list)  
+  
+def _unflatten_to_params(self, flat: torch.Tensor):  
+    """Distribute flat vector to parameters."""  
+    offset = 0  
+    for group in self.param_groups:  
+        for p in group['params']:  
+            if p.requires_grad:  
+                numel = p.numel()  
+                chunk = flat[offset:offset+numel]  
+                p.data.add_(chunk.view_as(p).to(p.device))  
+                offset += numel  
+  
+def step(self, closure: Optional[Callable] = None):  
+    """  
+    Take optimization step.  
+      
+    CRITICAL FIX: Gradient capture happens AFTER closure() to avoid stale gradients.  
+    PERFORMANCE FIX: Cooldown is checked BEFORE analysis.  
+    """  
+    self.step_count += 1  
+      
+    # ========================================================================  
+    # Step 1: Call closure FIRST to get fresh gradients  
+    # ========================================================================  
+    loss = None  
+    if closure is None:  
+        raise ValueError("SpectralAdaptiveOptimizer requires a closure")  
+          
+    with torch.enable_grad():  
+        loss = closure()  
+
+    # ========================================================================  
+    # Step 2: Capture the FRESH gradients  
+    # ========================================================================  
+    g = self.buffer.flatten_gradients()  
+    self.buffer.append(g)  
+      
+    # ========================================================================  
+    # Step 3: Analyze spectrum (with performance check)  
+    # ========================================================================  
+      
+    # PERFORMANCE FIX: Check policy's cooldown *before* analysis  
+    should_analyze = (  
+        self.step_count % self.analysis_frequency == 0 and  
+        self.buffer.is_full and  
+        self.policy.should_analyze(self.step_count) # <-- PASS STEP COUNT  
+    )  
+      
+    switched = False  
+      
+    if should_analyze:  
+        if self.verbose:  
+            print(f"\n{'='*70}")  
+            print(f"Step {self.step_count}: Spectral Analysis")  
+            print(f"{'='*70}")  
+          
+        G = self.buffer.get_history_matrix()  
+          
+        if G is not None:  
+            metrics = self.analyzer.analyze(G)  
+              
+            if self.verbose:  
+                print(f"  Gradient history: {G.shape[0]} × {G.shape[1]:,}")  
+                print(f"  ER: {metrics['er_pr']:.3f}")  
+                print(f"  SE_norm: {metrics['normalized_entropy']:.3f}")  
+                print(f"  LF: {metrics['lowfreq_ratio']:.3f}")  
+
+            # Track metrics  
+            self.metrics_history['step'].append(self.step_count)  
+            self.metrics_history['optimizer'].append(  
+                self.policy.current_optimizer.value  
+            )  
+            self.metrics_history['er'].append(metrics['er_pr'])  
+            self.metrics_history['se_norm'].append(metrics['normalized_entropy'])  
+            self.metrics_history['lf'].append(metrics['lowfreq_ratio'])  
+              
+            # Check switch (ATOMIC)  
+            new_opt = self.policy.should_switch(  
+                metrics,   
+                len(self.buffer),   
+                self.step_count # <-- PASS STEP COUNT  
+            )  
+              
+            if new_opt is not None:  
+                # Switch occurred!  
+                if self.warmstart_enabled:  
+                    modes = metrics['modes']  
+                    lambdas = metrics['energies']  
+                    self.preconditioner.update_from_modes(modes, lambdas)  
+                      
+                    if self.verbose:  
+                        print(f"  Taking warm-start step...")  
+                      
+                    p = self.preconditioner.direction(g)  
+                      
+                    descent_check = torch.dot(g, p).item()  
+                    if self.verbose:  
+                        print(f"    Descent check: g^T p = {descent_check:.6f}")  
+                      
+                    if descent_check >= 0:  
+                        if self.verbose:  
+                            print(f"    WARNING: Not descent direction, using -g")  
+                        p = -g  
+                      
+                    self._unflatten_to_params(1.0 * p)  
+                      
+                    # HARDENING: Zero grad after warm-start  
+                    self.zero_grad()  
+                      
+                    if self.verbose:  
+                        print(f"    ||p||: {p.norm().item():.6f}")  
+                  
+                switched = True  
+          
+        if self.verbose:  
+            print(f"{'='*70}\n")  
+      
+    # ========================================================================  
+    # Step 4: Take optimizer step (unless just switched with warmstart)  
+    # ========================================================================  
+      
+    if not switched:  
+        if self.policy.current_optimizer == OptimizerType.LBFGS:  
+            if closure is None:  
+                raise ValueError("L-BFGS requires closure")  
+            # L-BFGS will call closure internally again  
+            loss = self.lbfgs.step(closure)  
+        else:  
+            # Adam just uses the gradients we already computed  
+            self.adam.step()  
+      
+    # Track loss  
+    if loss is not None:  
+        self.metrics_history['loss'].append(float(loss))  
+      
+    return loss  
+  
+def state_dict(self):  
+    """Get state for checkpointing."""  
+    return {  
+        'step_count': self.step_count,  
+        'current_optimizer': self.policy.current_optimizer.value,  
+        'adam_state': self.adam.state_dict(),  
+        'lbfgs_state': self.lbfgs.state_dict(),  
+        # 'policy_step': self.policy.step_count, # <-- REMOVED  
+        'policy_last_switch': self.policy.last_switch_step,  
+        'switch_history': [  
+            {  
+                'step': s['step'],  
+                'from': s['from'].value,  
+                'to': s['to'].value,  
+                'reason': s.get('reason', 'N/A'),  
+                'er': s.get('er', 0.0),  
+                'se_norm': s.get('se_norm', 0.0),  
+                'lf': s.get('lf', 0.0)  
+            }  
+            for s in self.policy.switch_history  
+        ],  
+        'metrics': self.metrics_history  
+    }  
+  
+def load_state_dict(self, state_dict):  
+    """Load state from checkpoint."""  
+    self.step_count = state_dict['step_count']  
+      
+    self.adam.load_state_dict(state_dict['adam_state'])  
+    self.lbfgs.load_state_dict(state_dict['lbfgs_state'])  
+      
+    self.policy.current_optimizer = OptimizerType(state_dict['current_optimizer'])  
+    # self.policy.step_count = state_dict['policy_step'] # <-- REMOVED  
+    self.policy.last_switch_step = state_dict['policy_last_switch']  
+      
+    self.policy.switch_history = [  
+        {  
+            'step': s['step'],  
+            'from': OptimizerType(s['from']),  
+            'to': OptimizerType(s['to']),  
+            'reason': s.get('reason', 'N/A'),  
+            'er': s.get('er', 0.0),  
+            'se_norm': s.get('se_norm', 0.0),  
+            'lf': s.get('lf', 0.0)  
+        }  
+        for s in state_dict['switch_history']  
+    ]  
+      
+    self.metrics_history = state_dict.get('metrics', self.metrics_history)  
+  
+def print_summary(self):  
+    """Print comprehensive summary (Corrected)."""  
+    print(f"\n{'='*80}")  
+    print("OPTIMIZER SUMMARY")  
+    print(f"{'='*80}")  
+      
+    # Pass the *true* step count  
+    summary = self.policy.get_switch_summary(self.step_count)   
+      
+    print(f"Total steps: {summary['total_steps']}")  
+    print(f"Total switches: {summary['total_switches']}")  
+    print(f"Current: {self.policy.current_optimizer.value}")  
+    print(f"Avg dwell: {summary['avg_dwell_time']:.1f} steps")  
+      
+    print(f"\nTime distribution:")  
+    print(f"  Adam: {summary['time_in_adam']} steps ({summary['fraction_adam']:.1%})")  
+    print(f"  L-BFGS: {summary['time_in_lbfgs']} steps ({summary['fraction_lbfgs']:.1%})")  
+      
+    if summary['total_switches'] > 0:  
+        print(f"\nSwitch History:")  
+        for i, s in enumerate(self.policy.switch_history, 1):  
+            print(f"  {i}. Step {s['step']}: {s['from'].value} → {s['to'].value}")  
+            print(f"     {s.get('reason', 'N/A')}")  
+      
+    print(f"{'='*80}\n")
+
+============================================================================
+
+Example Usage
+
+============================================================================
+
+if name == "main":
+print(f"SpectralAdaptiveOptimizer - Production Ready (v{version})")
+
+# Simple test  
+model = nn.Sequential(  
+    nn.Linear(10, 20),  
+    nn.ReLU(),  
+    nn.Linear(20, 1)  
+)  
+  
+optimizer = SpectralAdaptiveOptimizer(  
+    model.parameters(),  
+    history_len=64,  
+    n_modes=8,  
+    analysis_frequency=5,  
+    history_device='cpu', # Be explicit  
+    verbose=True  
+)  
+  
+X = torch.randn(50, 10)  
+y = torch.randn(50, 1)  
+  
+print("Training...")  
+for step in range(100):  # Increased to 100 so buffer fills  
+    def closure():  
+        optimizer.zero_grad()  
+        loss = F.mse_loss(model(X), y)  
+        loss.backward()  
+        return loss  
+      
+    loss = optimizer.step(closure)  
+      
+    if (step + 1) % 20 == 0:  
+        print(f"Step {step+1}: Loss={loss.item():.4f}")  
+  
+optimizer.print_summary()

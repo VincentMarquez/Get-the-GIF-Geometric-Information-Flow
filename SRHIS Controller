@@ -1,0 +1,339 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+device = torch.device("cpu")
+
+# -------------------------------------------------------------------
+# SRHIS Controller
+# -------------------------------------------------------------------
+class SRHIS_Controller:
+    def __init__(self, tau_enter, tau_exit, D_min, ema_alpha=0.1):
+        assert D_min > 0, "D_min must be > 0"
+        self.tau_enter = tau_enter
+        self.tau_exit = tau_exit
+        self.D_min = D_min
+        
+        self.q = 'FAST'
+        self.mu = 0.0
+        self.s = 1e-6
+        self.tau_d = 0
+        self.ema_alpha = ema_alpha
+        self.eps = 1e-9
+        
+    def update(self, E_t):
+        z_t = (E_t - self.mu) / (np.sqrt(self.s) + self.eps)
+        
+        self.mu = (1 - self.ema_alpha) * self.mu + self.ema_alpha * E_t
+        self.s = (1 - self.ema_alpha) * self.s + self.ema_alpha * (E_t - self.mu)**2
+        
+        if self.q == 'FAST':
+            if z_t > self.tau_enter:
+                self.q = 'SOLVER'
+                self.tau_d = 0
+            else:
+                self.tau_d += 1
+        elif self.q == 'SOLVER':
+            if z_t < self.tau_exit and self.tau_d >= self.D_min:
+                self.q = 'FAST'
+                self.tau_d = 0
+            else:
+                self.tau_d += 1
+                
+        return self.q, z_t
+    
+    def reset(self):
+        self.q = 'FAST'
+        self.mu = 0.0
+        self.s = 1e-6
+        self.tau_d = 0
+
+# -------------------------------------------------------------------
+# FastOnly Model
+# -------------------------------------------------------------------
+class FastOnlyModel(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=64, output_dim=1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.rnn = nn.RNN(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x, h):
+        out, h_next = self.rnn(x, h)
+        y_pred = self.fc(out)
+        return y_pred, h_next
+
+# -------------------------------------------------------------------
+# SRHIS Model
+# -------------------------------------------------------------------
+class SRHIS_Model(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=64, output_dim=1,
+                 tau_enter=3.0, tau_exit=0.5, D_min=3, gn_steps=5,
+                 lookahead_steps=5, ablation_weights=None):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.lookahead_steps = lookahead_steps
+        self.ablation_weights = ablation_weights or {'smoothness': 1.0, 'energy': 0.1, 'decay': 0.5, 'trend': 0.5}
+        
+        self.u_fast = FastOnlyModel(input_dim, hidden_dim, output_dim).to(device)
+        self.gn_steps = gn_steps
+        self.controller = SRHIS_Controller(tau_enter, tau_exit, D_min)
+        self.criterion = nn.MSELoss()
+        
+    def u_gn_consistency_solver(self, h_corrupt, x_history):
+        h_t = h_corrupt.clone().detach().requires_grad_(True)
+        solver_optim = optim.Adam([h_t], lr=0.02)
+        
+        with torch.enable_grad():
+            for _ in range(self.gn_steps):
+                solver_optim.zero_grad()
+                
+                h_rollout = h_t
+                predictions = []
+                
+                for k in range(self.lookahead_steps):
+                    if k == 0:
+                        x_input = x_history[:, -1:, :]
+                    else:
+                        x_input = predictions[-1].detach()
+                    
+                    y_pred, h_rollout = self.u_fast(x_input, h_rollout)
+                    predictions.append(y_pred)
+                
+                predictions = torch.cat(predictions, dim=1)
+                
+                smoothness_loss = torch.mean((predictions[:, 1:, :] - predictions[:, :-1, :])**2)
+                energy_loss = torch.mean(predictions**2)
+                decay_loss = torch.relu(
+                    predictions[:, -1:, :].abs() - predictions[:, 0:1, :].abs()
+                ).mean()
+                
+                if x_history.shape[1] >= 2:
+                    expected_trend = x_history[:, -1:, :] - x_history[:, -2:-1, :]
+                    actual_trend = predictions[:, 0:1, :] - x_history[:, -1:, :]
+                    trend_loss = ((expected_trend - actual_trend)**2).mean()
+                else:
+                    trend_loss = 0.0
+                
+                total_loss = (
+                    self.ablation_weights['smoothness'] * smoothness_loss + 
+                    self.ablation_weights['energy'] * energy_loss + 
+                    self.ablation_weights['decay'] * decay_loss +
+                    self.ablation_weights['trend'] * trend_loss
+                )
+                
+                total_loss.backward()
+                solver_optim.step()
+        
+        return h_t.detach()
+    
+    def compute_self_consistency_error(self, h, x_history):
+        with torch.no_grad():
+            h_rollout = h
+            predictions = []
+            
+            for k in range(self.lookahead_steps):
+                if k == 0:
+                    x_input = x_history[:, -1:, :]
+                else:
+                    x_input = predictions[-1]
+                
+                y_pred, h_rollout = self.u_fast(x_input, h_rollout)
+                predictions.append(y_pred)
+            
+            predictions = torch.cat(predictions, dim=1)
+            
+            smoothness = ((predictions[:, 1:, :] - predictions[:, :-1, :])**2).mean()
+            instability = (predictions**2).mean()
+            
+            E_t = (smoothness + 0.1 * instability).item()
+            
+        return E_t
+    
+    def forward(self, x_seq, history_len=5, use_solver=True):
+        batch_size, seq_len, _ = x_seq.shape
+        
+        outputs = torch.zeros(batch_size, seq_len, 1, device=device)
+        controller_log = {'mode': [], 'z_score': [], 'error': []}
+        
+        h = torch.zeros(1, batch_size, self.hidden_dim, device=device)
+        total_solver_steps = 0
+        
+        x_history = torch.zeros(batch_size, history_len, 1, device=device)
+        
+        for t in range(seq_len):
+            x_t = x_seq[:, t:t+1, :]
+            x_history = torch.cat([x_history[:, 1:, :], x_t], dim=1)
+            
+            y_pred, h_next = self.u_fast(x_t, h)
+            
+            if use_solver and t >= history_len:
+                E_t = self.compute_self_consistency_error(h_next, x_history)
+                mode, z_t = self.controller.update(E_t)
+                
+                if mode == 'FAST':
+                    h = h_next.detach()
+                elif mode == 'SOLVER':
+                    h = self.u_gn_consistency_solver(h_next, x_history)
+                    total_solver_steps += 1
+            else:
+                h = h_next.detach()
+                E_t = 0.0
+                mode = 'FAST'
+                z_t = 0.0
+            
+            outputs[:, t:t+1, :] = y_pred
+            controller_log['mode'].append(1 if mode == 'SOLVER' else 0)
+            controller_log['z_score'].append(z_t)
+            controller_log['error'].append(E_t)
+        
+        return outputs, controller_log, total_solver_steps
+
+# -------------------------------------------------------------------
+# Data Generation
+# -------------------------------------------------------------------
+def get_damped_wave_data(seq_len=200, n_batches=1, noise_std=0.02):
+    x_seq_list = []
+    y_seq_list = []
+    
+    for _ in range(n_batches):
+        t0 = np.random.rand() * 5
+        t = torch.linspace(t0, t0 + 10, seq_len, device=device)
+        
+        decay = np.random.uniform(0.05, 0.15)
+        freq = np.random.uniform(2.5, 3.5)
+        phase = np.random.uniform(0, np.pi)
+        
+        y = torch.exp(-decay * t) * torch.sin(freq * t + phase)
+        
+        x_seq = y[:-1]
+        y_seq = y[1:]
+        x_seq += torch.randn_like(x_seq) * noise_std
+        
+        x_seq_list.append(x_seq)
+        y_seq_list.append(y_seq)
+    
+    x_batch = torch.stack(x_seq_list).view(n_batches, seq_len - 1, 1)
+    y_batch = torch.stack(y_seq_list).view(n_batches, seq_len - 1, 1)
+    
+    return x_batch, y_batch
+
+# -------------------------------------------------------------------
+# Training
+# -------------------------------------------------------------------
+def train(model, optimizer, criterion, epochs=50, batch_size=8):
+    print(f"\nTraining {model.__class__.__name__}...")
+    model.train()
+    
+    for epoch in range(epochs):
+        x, y = get_damped_wave_data(seq_len=100, n_batches=batch_size)
+        optimizer.zero_grad()
+        
+        if isinstance(model, SRHIS_Model):
+            model.controller.reset()
+            y_pred, _, _ = model(x, use_solver=True)
+            loss = model.criterion(y_pred, y)
+        else:
+            h = torch.zeros(1, batch_size, model.hidden_dim, device=device)
+            y_pred, _ = model(x, h)
+            loss = criterion(y_pred, y)
+        
+        loss.backward()
+        optimizer.step()
+        
+        if (epoch + 1) % 25 == 0:
+            print(f"  Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
+
+# -------------------------------------------------------------------
+# Evaluation for FastOnly
+# -------------------------------------------------------------------
+def eval_fast_only(fast_model, seq_len=400, spike_time=150, spike_mag=4.0):
+    fast_model.eval()
+    x_val, y_val = get_damped_wave_data(seq_len=seq_len + 1, n_batches=1, noise_std=0.0)
+    x_val[0, spike_time, 0] = spike_mag
+    
+    with torch.no_grad():
+        h_fast = torch.zeros(1, 1, fast_model.hidden_dim, device=device)
+        y_fast_pred, _ = fast_model(x_val, h_fast)
+    
+    mse_fast = ((y_fast_pred - y_val)**2).mean().item()
+    return mse_fast, x_val, y_val, y_fast_pred
+
+# -------------------------------------------------------------------
+# Evaluation for SRHIS
+# -------------------------------------------------------------------
+def eval_srhis(srhis_model, x_val, y_val):
+    srhis_model.eval()
+    srhis_model.controller.reset()
+    with torch.no_grad():
+        y_srhis_pred, log, solver_steps = srhis_model(x_val, use_solver=True)
+    
+    mse_srhis = ((y_srhis_pred - y_val)**2).mean().item()
+    return mse_srhis, solver_steps, log
+
+# -------------------------------------------------------------------
+# Main Ablation
+# -------------------------------------------------------------------
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Train FastOnly
+fast_model = FastOnlyModel(hidden_dim=64).to(device)
+fast_optim = optim.Adam(fast_model.parameters(), lr=0.001)
+train(fast_model, fast_optim, nn.MSELoss(), epochs=350, batch_size=8)
+
+# Get FastOnly MSE
+mse_fast, x_val, y_val, y_fast_pred = eval_fast_only(fast_model)
+print(f"\nFastOnly MSE: {mse_fast:.6f}")
+
+# Ablation configurations
+ablation_configs = {
+    'full': {'smoothness': 1.0, 'energy': 0.1, 'decay': 0.5, 'trend': 0.5},
+    'no_smoothness': {'smoothness': 0.0, 'energy': 0.1, 'decay': 0.5, 'trend': 0.5},
+    'no_energy': {'smoothness': 1.0, 'energy': 0.0, 'decay': 0.5, 'trend': 0.5},
+    'no_decay': {'smoothness': 1.0, 'energy': 0.1, 'decay': 0.0, 'trend': 0.5},
+    'no_trend': {'smoothness': 1.0, 'energy': 0.1, 'decay': 0.5, 'trend': 0.0}
+}
+
+results = {}
+
+seq_len = 400
+
+for name, weights in ablation_configs.items():
+    print(f"\n--- Ablation: {name} ---")
+    srhis_model = SRHIS_Model(
+        hidden_dim=64,
+        tau_enter=3.0,
+        tau_exit=0.5,
+        D_min=3,
+        gn_steps=8,
+        lookahead_steps=5,
+        ablation_weights=weights
+    ).to(device)
+    srhis_optim = optim.Adam(srhis_model.u_fast.parameters(), lr=0.001)
+    
+    train(srhis_model, srhis_optim, None, epochs=350, batch_size=8)
+    
+    mse_srhis, solver_steps, log = eval_srhis(srhis_model, x_val, y_val)
+    
+    improvement = (1 - mse_srhis / mse_fast) * 100 if mse_srhis < mse_fast else (mse_srhis / mse_fast - 1) * 100
+    trigger_rate = (solver_steps / seq_len) * 100
+    results[name] = {
+        'mse_srhis': mse_srhis, 
+        'solver_steps': solver_steps, 
+        'trigger_rate': trigger_rate, 
+        'improvement_pct': improvement
+    }
+    
+    print(f"SRHIS MSE: {mse_srhis:.6f}")
+    print(f"Solver triggered: {solver_steps}/{seq_len} times ({trigger_rate:.1f}%)")
+    print(f"Improvement: {improvement:.1f}%")
+    
+    # Clean up
+    del srhis_model, srhis_optim
+
+print("\n=== Ablation Results Summary ===")
+print("Config\t\tMSE_SRHS\tTriggers\tRate%\t\tImprovement%")
+for name, res in results.items():
+    print(f"{name:<12}\t{res['mse_srhis']:.6f}\t{res['solver_steps']}\t\t{res['trigger_rate']:.1f}\t\t{res['improvement_pct']:.1f}")

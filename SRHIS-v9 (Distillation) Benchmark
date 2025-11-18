@@ -1,0 +1,262 @@
+SRHIS-v9 (Distillation) Benchmark
+=================================
+1.  PlainMamba (Baseline)
+2.  SRHIS-v3 (Brute Force - The previous winner)
+3.  SRHIS-v9 (Distill) - The new challenger.
+
+SRHIS-v9 Training Logic:
+ - loss_task: The *entire model* (all 3 lanes fused) is trained to match the noisy target Y.
+ - loss_distill: The *entire model* (all 3 lanes fused) is ALSO trained to
+   match the CLEAN output of the Solver.
+ - loss = (1-w) * loss_task + (w) * loss_distill
+
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import time
+from mamba_ssm import Mamba
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[SRHIS-v9 Benchmark] Running on: {DEVICE}")
+
+# ======================================================================
+# 1) DATA
+# ======================================================================
+def make_long_noisy_sine(T=1000, B=8, Fin=32, Fout=8, device=DEVICE, seed=42):
+    g = torch.Generator(device=device).manual_seed(seed)
+    t = torch.arange(T, device=device).float().unsqueeze(-1).unsqueeze(-1)
+    freqs = torch.logspace(-1.5, 0.0, Fin // 2, device=device).unsqueeze(0).unsqueeze(0)
+   
+    sin = torch.sin(t * freqs)
+    cos = torch.cos(t * freqs)
+    signal = torch.cat([sin, cos], dim=-1).repeat(1, B, 1)
+    noise = torch.randn(T, B, Fin, device=device, generator=g) * 1.2
+    X = signal + noise
+    W = torch.randn(Fin, Fout, device=device, generator=g) * 0.5
+    Y = torch.einsum("tbf,fo->tbo", signal, W)
+    return X.float(), Y.float()
+
+def split_data(X, Y):
+    split_idx = int(len(X) * 0.8)
+    # Transpose to (B, T, D) for Mamba
+    X_train, Y_train = X[:split_idx].transpose(0, 1), Y[:split_idx].transpose(0, 1)
+    X_val, Y_val = X[split_idx:].transpose(0, 1), Y[split_idx:].transpose(0, 1)
+    return X_train, Y_train, X_val, Y_val
+
+# ======================================================================
+# 2) SHARED SOLVER
+# ======================================================================
+class GN_Solver(nn.Module):
+    def __init__(self, decoder, steps=5):
+        super().__init__()
+        self.decoder = decoder
+        self.steps = steps
+   
+    def forward(self, z, target):
+        z = z.detach().clone().requires_grad_(True)
+        opt = optim.SGD([z], lr=0.1, momentum=0.9)
+        with torch.enable_grad():
+            for _ in range(self.steps):
+                opt.zero_grad()
+                pred = self.decoder(z)
+                loss = F.mse_loss(pred, target)
+                loss.backward()
+                opt.step()
+        return z.detach()
+
+# ======================================================================
+# 3) MODEL DEFINITIONS
+# ======================================================================
+
+# --- Model 1: The Baseline ---
+class PlainMamba(nn.Module):
+    def __init__(self, in_dim=32, d_model=64, out_dim=8):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.mamba = Mamba(d_model=d_model, d_state=16, expand=2)
+        self.decoder = nn.Linear(d_model, out_dim)
+
+    def forward(self, x): # x is (B, T, F)
+        x_emb = self.in_proj(x)
+        out_m = self.mamba(x_emb)
+        return self.decoder(out_m)
+
+# --- Model 2: The "Brute Force" (Current Winner) ---
+class SRHIS_v3_BruteForce(nn.Module):
+    def __init__(self, in_dim=32, d_model=64, out_dim=8):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.lane_fast = Mamba(d_model=d_model, d_state=16, expand=2)
+        self.lane_detail = Mamba(d_model=d_model, d_state=64, expand=2)
+        self.lane_context = Mamba(d_model=d_model, d_state=16, expand=4)
+        self.fusion_weights = nn.Parameter(torch.ones(3))
+        self.decoder = nn.Linear(d_model, out_dim)
+
+    def forward(self, x): # x is (B, T, F)
+        x_emb = self.in_proj(x)
+        out1 = self.lane_fast(x_emb)
+        out2 = self.lane_detail(x_emb)
+        out3 = self.lane_context(x_emb)
+        w = F.softmax(self.fusion_weights, dim=0)
+        fused = w[0]*out1 + w[1]*out2 + w[2]*out3
+        return self.decoder(fused)
+
+# --- Model 3: The "Distillation" Challenger ---
+class SRHIS_v9_Distill(nn.Module):
+    def __init__(self, in_dim=32, d_model=64, out_dim=8):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.lane_fast = Mamba(d_model=d_model, d_state=16, expand=2)
+        self.lane_detail = Mamba(d_model=d_model, d_state=64, expand=2)
+        self.lane_context = Mamba(d_model=d_model, d_state=16, expand=4)
+        self.fusion_weights = nn.Parameter(torch.ones(3))
+        self.decoder = nn.Linear(d_model, out_dim)
+        self.solver = GN_Solver(self.decoder)
+
+    def forward(self, x, target=None, training_with_solver=False):
+        x_emb = self.in_proj(x)
+       
+        out_fast = self.lane_fast(x_emb)
+        out_detail = self.lane_detail(x_emb)
+        out_context = self.lane_context(x_emb)
+       
+        w = F.softmax(self.fusion_weights, dim=0)
+        fused_hidden = w[0]*out_fast + w[1]*out_detail + w[2]*out_context
+        pred = self.decoder(fused_hidden)
+       
+        if training_with_solver and target is not None:
+            t_idx = torch.randint(0, x.shape[1], (1,)).item()
+            # Note: We use the *fused* state as the input to the solver
+            # This teaches the solver to correct the *team's* best guess
+            z_slice = fused_hidden[:, t_idx, :]
+            y_slice = target[:, t_idx, :]
+            z_refined = self.solver(z_slice, y_slice)
+           
+            # Return the main prediction AND the refined components
+            return pred, z_refined, t_idx
+
+        # --- Fair Inference Path ---
+        return pred
+
+# ======================================================================
+# 4) UNIFIED TRAINING & BENCHMARKING
+# ======================================================================
+
+def train_model(model, name, Xt, Yt, Xv, Yv, epochs):
+    print(f"\n--- Training {name} ---")
+    opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
+    criterion = nn.MSELoss()
+   
+    history = []
+    best_loss = float('inf')
+    start_time = time.time()
+   
+    for ep in range(epochs):
+        model.train()
+        opt.zero_grad()
+       
+        # --- Model-Specific Training Logic ---
+        if isinstance(model, SRHIS_v9_Distill):
+            # --- Knowledge Distillation Loss ---
+            pred_team, z_refined, t_idx = model(Xt, Yt, training_with_solver=True)
+           
+            # 1. Task Loss (Team vs Noisy Target)
+            loss_task = criterion(pred_team, Yt)
+           
+            # 2. Distill Loss (Team vs Clean Target)
+            # The "target" is the solver's refined *output*
+            target_refined = model.decoder(z_refined).detach()
+            # The "prediction" is the team's output at that same time step
+            pred_at_t = pred_team[:, t_idx, :]
+            loss_distill = criterion(pred_at_t, target_refined)
+           
+            # 3. Teacher Decay
+            teacher_weight = 0.25 * (1 - ep / epochs) # Start at 25%
+            loss = (1.0 - teacher_weight) * loss_task + teacher_weight * loss_distill
+
+        else: # PlainMamba or BruteForce
+            pred = model(Xt)
+            loss = criterion(pred, Yt)
+       
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        scheduler.step()
+
+        # --- Unified Validation Loop (ALWAYS FAIR) ---
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(Xv)
+            val_loss = criterion(val_pred, Yv).item()
+            history.append(val_loss)
+       
+        if val_loss < best_loss:
+            best_loss = val_loss
+           
+        if (ep + 1) % (epochs // 10) == 0:
+            print(f"  Epoch {ep+1:03d}/{epochs} | Val Loss: {val_loss:.4f} (Best: {best_loss:.4f})")
+           
+    end_time = time.time()
+    print(f"  Final Loss: {history[-1]:.4f} | Best Loss: {best_loss:.4f} | Time: {end_time - start_time:.1f}s")
+    return history, best_loss
+
+def run_benchmark():
+    EPOCHS = 200 # A good balance
+    X, Y = make_long_noisy_sine()
+    # Note: Data is (B, T, D) for Mamba-native processing
+    Xt, Yt, Xv, Yv = split_data(X, Y)
+    print(f"Data shapes: X_train={Xt.shape}, Y_train={Yt.shape}")
+   
+    baseline = PlainMamba(in_dim=Xt.shape[2], out_dim=Yt.shape[2]).to(DEVICE)
+    brute_force = SRHIS_v3_BruteForce(in_dim=Xt.shape[2], out_dim=Yt.shape[2]).to(DEVICE)
+    distill = SRHIS_v9_Distill(in_dim=Xt.shape[2], out_dim=Yt.shape[2]).to(DEVICE)
+   
+    models = {
+        "PlainMamba (Baseline)": baseline,
+        "SRHIS-v3 (Brute Force)": brute_force,
+        "SRHIS-v9 (Distill)": distill,
+    }
+   
+    results = {}
+    final_scores = {}
+
+    for name, model in models.items():
+        hist, best = train_model(model, name, Xt, Yt, Xv, Yv, epochs=EPOCHS)
+        results[name] = hist
+        final_scores[name] = best
+       
+    # Plot Results
+    plt.figure(figsize=(12, 7))
+    colors = ['gray', 'blue', 'green']
+    styles = ['--', '-', '-']
+   
+    for i, (name, history) in enumerate(results.items()):
+        plt.plot(history, label=f"{name} (Best: {final_scores[name]:.4f})",
+                 color=colors[i], linestyle=styles[i], linewidth=2.5)
+       
+    plt.axhline(y=final_scores["PlainMamba (Baseline)"], color='gray', linestyle=':',
+                label=f"Baseline Score: {final_scores['PlainMamba (Baseline)']:.4f}")
+   
+    plt.yscale('log')
+    plt.title(f"SRHIS v9 Benchmark: Distillation vs. Brute Force ({EPOCHS} Epochs)")
+    plt.xlabel("Epochs")
+    plt.ylabel("Validation MSE Loss (Log Scale)")
+    plt.legend()
+    plt.grid(True, which="both", ls="--", alpha=0.3)
+    plt.savefig("benchmark_v9_results.png")
+   
+    print("\n" + "="*50)
+    print("SRHIS v9 FINAL BENCHMARK RESULTS")
+    print("="*50)
+    for name, score in sorted(final_scores.items(), key=lambda item: item[1]):
+        print(f"  {name:<25}: {score:.4f}")
+    print("="*50)
+    print("Benchmark complete. Plot saved to 'benchmark_v9_results.png'")
+
+if __name__ == "__main__":
+    run_benchmark()

@@ -35,8 +35,7 @@ It evolves a **product state space** with multiple interacting components:
 | ( E_t )             | Scalar energy governing compute allocation                   |
 | ( \alpha_{\ell,t} ) | Fusion weights over parallel lanes                           |
 
-Most neural models maintain **one** latent state.
-GIF maintains **multiple coupled geometric states**.
+
 
 ---
 
